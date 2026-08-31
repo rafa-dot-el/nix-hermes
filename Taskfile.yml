@@ -1,0 +1,151 @@
+version: "3"
+
+silent: true
+
+vars:
+  PKG_DIR: "{{.TASKFILE_DIR}}"
+
+tasks:
+  default:
+    desc: "List tasks"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - task --list-all
+
+  check:
+    desc: "Instantiate (eval check) via this package's own flake"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix eval --raw .#default.drvPath
+
+  lint:
+    desc: "Parse-check all .nix files"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        rc=0
+        for f in *.nix; do
+          [ -f "$f" ] || continue
+          nix-instantiate --parse "$f" >/dev/null 2>&1 || { echo "FAIL: $f"; rc=1; }
+        done
+        exit $rc
+
+  build:
+    desc: "Build the default package (hermes CLI + TUI + web dashboard + ACP + TTS/STT) via this package's own flake"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix build .#default --no-link
+
+  build:desktop:
+    desc: "Build the Hermes Desktop (Electron) application"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix build .#desktop --no-link
+
+  run:
+    desc: >-
+      Build and run the Hermes CLI from this package's flake. Pass extra
+      args after -- (e.g. task run -- doctor).
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build --no-link --print-out-paths .#default)"
+        echo "[+] Built: $out"
+        exec "$out/bin/hermes" {{.CLI_ARGS}}
+
+  test:
+    desc: "Run passthru.tests if defined, else build the package itself"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        if nix eval --json .#default.passthru.tests >/dev/null 2>&1; then
+          nix build .#default.passthru.tests --no-link
+        else
+          echo "no passthru.tests -- building package itself"
+          nix build .#default --no-link
+        fi
+
+  cache:push:
+    desc: >-
+      Build hermes-agent via its own standalone flake and push the
+      resulting store path to the rafa-dot-el Cachix cache. Reads the push
+      token from pass (code/cachix/tokens-main-ci); never persists it to
+      disk.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        out="$(nix build .#default --no-link --print-out-paths)"
+        echo "[*] Pushing $out to rafa-dot-el..."
+        CACHIX_AUTH_TOKEN="$(pass show code/cachix/tokens-main-ci)" \
+          nix run nixpkgs#cachix -- push rafa-dot-el "$out"
+        echo "[+] Pushed hermes-agent to rafa-dot-el"
+
+  clean:
+    desc: "Remove local build symlinks (does not touch the Nix store). Fast (~1s)."
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - rm -rf result result-*
+
+  check-update:
+    desc: >-
+      Compare the pinned upstream tag (flake.nix hermes-agent-src.url) against
+      the newest calendar-versioned tag (vYYYY.M.D[.N]) on
+      NousResearch/hermes-agent. Exit 2 when an update is available.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        FLAKE="{{.PKG_DIR}}/flake.nix"
+        PINNED="$(grep -m1 'hermes-agent-src.url' "$FLAKE" | sed -E 's#.*/hermes-agent/([^"]+)".*#\1#')"
+        LATEST="$(git ls-remote --tags --refs https://github.com/NousResearch/hermes-agent \
+          | sed -E 's#.*refs/tags/##' \
+          | grep -E '^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$' \
+          | sort -V | tail -1)"
+        echo "check-update: pinned=${PINNED} latest=${LATEST}"
+        if [ "$PINNED" != "$LATEST" ]; then
+          echo "check-update: update available (${PINNED} -> ${LATEST})" >&2
+          exit 2
+        fi
+
+  update:
+    desc: >-
+      Bump hermes-agent-src.url to the newest upstream tag, refresh
+      flake.lock, then check+build. Pass TAG=vYYYY.M.D to pin explicitly
+      instead of auto-detecting the latest.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        FLAKE="{{.PKG_DIR}}/flake.nix"
+        TAG="${TAG:-}"
+        if [ -z "$TAG" ]; then
+          TAG="$(git ls-remote --tags --refs https://github.com/NousResearch/hermes-agent \
+            | sed -E 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$' \
+            | sort -V | tail -1)"
+        fi
+        perl -i -pe 's#(github:NousResearch/hermes-agent/)[^"]+#${1}'"${TAG}"'#' "$FLAKE"
+        echo "update: pinned hermes-agent-src to ${TAG}"
+      - task: update:flake-lock
+      - task: check
+      - task: build
+
+  update:flake-lock:
+    internal: true
+    desc: "Refresh this package's own flake.lock"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix flake update
