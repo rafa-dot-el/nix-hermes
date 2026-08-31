@@ -1,0 +1,46 @@
+name: Build and publish to Cachix
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        system:
+          - x86_64-linux
+          - aarch64-linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-platforms = aarch64-linux
+
+      - name: Lint Nix files
+        run: nix run nixpkgs#go-task -- lint
+
+      - name: Check instantiation
+        run: nix run nixpkgs#go-task -- check --system ${{ matrix.system }}
+
+      - name: Build package
+        run: nix build --system ${{ matrix.system }} .#default --no-link
+
+      - name: Push to Cachix
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          nix run nixpkgs#cachix -- push rafa-dot-el --watch-store --system ${{ matrix.system }} &
+          nix build --system ${{ matrix.system }} .#default --no-link
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
