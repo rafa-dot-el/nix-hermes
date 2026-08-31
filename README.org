@@ -1,0 +1,289 @@
+#+title: nix-hermes: Hermes AI Agent for NixOS/home-manager
+#+author: Rafael
+#+language: en
+
+* Overview
+
+A Nix flake wrapping [[https://github.com/NousResearch/hermes-agent][Nous Research's hermes-agent]] (v2026.8.27) with production-ready packaging for NixOS and home-manager.
+
+** What it adds
+
+- **Chromium** (local, on PATH) for browser automation
+- **Piper TTS** (local, GPL-3, no API keys, no per-call network round-trips)
+- **browser-use CLI** for autonomous browser control (attaches to running Chromium via CDP)
+- **LSP servers** pre-baked on PATH: pyright, typescript-language-server, gopls, rust-analyzer, clangd, nixd
+- **STT model** (faster-whisper "base") pre-fetched to avoid lazy downloads
+- **Wake word** (sherpa) with exact pinned versions to avoid runtime dependency mismatches
+
+** What it re-exports
+
+- NixOS system module (`nixosModules.default`)
+- home-manager module (`homeManagerModules.default`)
+- Prebuilt Hermes CLI, TUI, web dashboard, ACP, and Electron desktop
+
+Upstream's own Nix packaging (NousResearch/hermes-agent) handles the heavy lifting; this wrapper adds the missing pieces for production use.
+
+* Quick Start
+
+** NixOS system
+
+Add to your flake.nix:
+
+#+begin_src nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    hermes-nix = {
+      url = "github:rafa-dot-el/nix-hermes";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, hermes-nix }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+    in
+    {
+      nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          ./hardware-configuration.nix
+          hermes-nix.nixosModules.default
+          {
+            services.hermes-agent.enable = true;
+          }
+        ];
+      };
+    };
+}
+#+end_src
+
+Then:
+
+#+begin_src bash
+nixos-rebuild switch --flake .#myhost
+#+end_src
+
+** home-manager
+
+Add to your home.nix:
+
+#+begin_src nix
+{
+  imports = [
+    # ... other imports
+  ];
+
+  inputs = {
+    home-manager.url = "github:nix-community/home-manager";
+    hermes-nix = {
+      url = "github:rafa-dot-el/nix-hermes";
+    };
+  };
+
+  home.packages = [
+    inputs.hermes-nix.packages.${pkgs.system}.default
+  ];
+
+  imports = [
+    inputs.hermes-nix.homeManagerModules.default
+  ];
+}
+#+end_src
+
+Or via standalone home-manager:
+
+#+begin_src bash
+# Add to ~/.config/home-manager/flake.nix inputs
+hermes-nix.url = "github:rafa-dot-el/nix-hermes"
+
+# In home.nix
+imports = [ hermes-nix.homeManagerModules.default ];
+home.packages = [ hermes-nix.packages.${system}.default ];
+
+# Apply
+home-manager switch --flake ~/.config/home-manager
+#+end_src
+
+* Configuration
+
+** Piper TTS (local text-to-speech)
+
+Edit your Hermes config.yaml:
+
+#+begin_src yaml
+tts:
+  provider: piper
+  piper:
+    # Path to the bundled Piper voice model
+    voice: /run/current-system/sw/share/hermes-agent/piper-voices/en_GB-alba-medium.onnx
+#+end_src
+
+No API key needed. Piper runs locally with zero network round-trips.
+
+To use a different voice, download from [[https://huggingface.co/rhasspy/piper-voices][rhasspy/piper-voices]] and update the path.
+
+** STT (speech-to-text)
+
+By default, faster-whisper "base" is bundled. Configure in config.yaml:
+
+#+begin_src yaml
+stt:
+  local:
+    model: /run/current-system/sw/share/hermes-agent/faster-whisper-base
+#+end_src
+
+** Browser automation (browser-use + agent-browser)
+
+The CLI has two browser backends:
+- **browser-use**: Autonomous agent-driven browser control (requires Chromium running with --remote-debugging-port)
+- **agent-browser**: Built-in browser toolset for hermes_agent (CDP-driven)
+
+Both auto-detect Chromium on PATH (included in this package).
+
+** Wake word (sherpa)
+
+Configured via config.yaml:
+
+#+begin_src yaml
+wake_word:
+  provider: sherpa
+#+end_src
+
+Default supports any phrase in English; no training needed.
+
+* Cachix Binary Cache
+
+To avoid 30+ minute builds on first install, use the binary cache:
+
+** NixOS
+
+Add to your configuration.nix:
+
+#+begin_src nix
+{
+  nix.settings = {
+    substituters = [
+      "https://cache.nixos.org"
+      "https://rafa-dot-el.cachix.org"
+    ];
+    trusted-public-keys = [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypQMvCrm3fqYWDaP5fsQwkq6kjI="
+      "rafa-dot-el.cachix.org-1:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX="
+    ];
+  };
+}
+#+end_src
+
+(Replace the key placeholder with the actual public key from the cache.)
+
+** home-manager
+
+Add to your home.nix:
+
+#+begin_src nix
+{
+  nix.settings = {
+    substituters = [
+      "https://cache.nixos.org"
+      "https://rafa-dot-el.cachix.org"
+    ];
+    trusted-public-keys = [
+      "cache.nixos.org-1:6NCHdD59X431o0gWypQMvCrm3fqYWDaP5fsQwkq6kjI="
+      "rafa-dot-el.cachix.org-1:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX="
+    ];
+  };
+}
+#+end_src
+
+With the cache configured, `nixos-rebuild` or `home-manager switch` pulls pre-built binaries instead of building locally.
+
+* Building from source
+
+If you prefer to build locally (or the cache is unavailable):
+
+#+begin_src bash
+nix build github:rafa-dot-el/nix-hermes#default --no-link
+#+end_src
+
+Or in a flake project with `hermes-nix` as an input:
+
+#+begin_src bash
+nix build .#hermes-nix.packages.${system}.default --no-link
+#+end_src
+
+** Multi-architecture builds
+
+Currently supported: x86_64-linux, aarch64-linux
+
+#+begin_src bash
+# Build for aarch64 on x86_64 (requires remote builder or native aarch64 system)
+nix build --system aarch64-linux github:rafa-dot-el/nix-hermes#default
+#+end_src
+
+* Features
+
+- ✓ Local Chromium for browser automation
+- ✓ Piper TTS (no cloud services, no API keys)
+- ✓ browser-use for autonomous browser control
+- ✓ LSP servers (6 languages supported)
+- ✓ STT (faster-whisper) pre-fetched
+- ✓ Wake word (sherpa) with exact version pinning
+- ✓ Pre-built Hermes CLI, TUI, web dashboard
+- ✓ Electron desktop app (passthru.hermesDesktop)
+- ✓ NixOS module + home-manager module
+- ✓ Binary cache (Cachix) for fast installs
+- ✓ Supports x86_64-linux and aarch64-linux
+
+* Troubleshooting
+
+** Piper TTS not found
+
+Check that the voice path exists:
+
+#+begin_src bash
+ls -la /run/current-system/sw/share/hermes-agent/piper-voices/
+#+end_src
+
+If missing, verify Hermes is installed correctly and Nix cache is working.
+
+** Browser automation not working
+
+Ensure Chromium is on PATH:
+
+#+begin_src bash
+which chromium
+#+end_src
+
+If not found, verify the Hermes package is correctly installed with extraPathTools.
+
+** LSP server not detected
+
+Verify the server is on PATH:
+
+#+begin_src bash
+which pyright typescript-language-server gopls rust-analyzer clangd nixd
+#+end_src
+
+Configure in Hermes: =lsp.install_strategy: manual= in config.yaml.
+
+** Build timeout or OOM
+
+If building locally (without Cachix), the build is resource-intensive (~30 min on modern hardware, ~8GB RAM). Use the binary cache or increase system resources.
+
+* Repository
+
+- **Public (GitHub):** https://github.com/rafa-dot-el/nix-hermes
+- **Internal (private):** https://g.strm.sh/nix/hermes (source of truth)
+
+* License
+
+GPL-3.0 (same as Hermes and Piper)
+
+* References
+
+- [[https://github.com/NousResearch/hermes-agent][NousResearch/hermes-agent]]
+- [[https://huggingface.co/rhasspy/piper-voices][rhasspy/piper-voices (Hugging Face)]]
+- [[https://github.com/vercel-labs/agent-browser][vercel-labs/agent-browser]]
+- [[https://browser-use.com/][Browser Use documentation]]
