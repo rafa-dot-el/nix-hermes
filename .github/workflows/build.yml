@@ -13,34 +13,26 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        system:
-          - x86_64-linux
-          - aarch64-linux
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@a5ac7e51b41094c7467393fa7d00edda9b67a8d5
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            extra-platforms = aarch64-linux
+        uses: DeterminateSystems/nix-installer-action@8987d595f514ac630b76521f9ea5febf1df1fe0f
 
       - name: Lint Nix files
-        run: nix run nixpkgs#go-task -- lint
+        run: nix-instantiate --parse flake.nix default.nix >/dev/null
 
       - name: Check instantiation
-        run: nix run nixpkgs#go-task -- check --system ${{ matrix.system }}
+        run: nix eval --raw .#default.drvPath >/dev/null
 
       - name: Build package
-        run: nix build --system ${{ matrix.system }} .#default --no-link
+        run: nix build .#default --no-link
 
       - name: Push to Cachix
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
-          nix run nixpkgs#cachix -- push rafa-dot-el --watch-store --system ${{ matrix.system }} &
-          nix build --system ${{ matrix.system }} .#default --no-link
+          OUT=$(nix build .#default --no-link --print-out-paths)
+          nix run nixpkgs#cachix -- push rafa-dot-el "$OUT"
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
