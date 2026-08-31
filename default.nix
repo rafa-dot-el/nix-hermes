@@ -1,79 +1,15 @@
-# hermes-agent — thin wrapper over upstream's own `packages.<system>.default`.
-#
-# Upstream's "default" is already the fully-loaded build (see the
-# NousResearch/hermes-agent checkout, nix/packages.nix "full"): hermes CLI,
-# hermes-agent, hermes-acp (ACP support), bundled TUI + web dashboard,
-# passthru Electron desktop, STT (faster-whisper/"voice"), messaging
-# gateways, ripgrep/git/ffmpeg/openssh on PATH, and the bundled plugins tree
-# (disk-cleanup, kanban, ... — enabled at runtime via `hermes tools` /
-# config.yaml, not a Nix concern). This wrapper changes three things:
-#
-#   1. Local Chromium on PATH for browser automation (upstream ships none).
-#   2. TTS: drops the cloud backends (edge-tts, elevenlabs/tts-premium) in
-#      favour of Piper — fully local, GPL-3, no API key, no per-call network
-#      round-trip. A default voice model is fetched here with a verified
-#      hash and baked into the store, so nothing downloads at first use
-#      (upstream's own Piper path lazily runs `python -m
-#      piper.download_voices` on first call otherwise).
-#   3. browser-use CLI (Hermes' `browser_exec` tool backend) vendored and
-#      put on PATH, so `_find_cli()` in tools/browser_use_cli.py finds it
-#      immediately instead of lazily running `uv tool install browser-use`
-#      on first use (a live PyPI fetch). It only attaches over CDP to an
-#      already-running Chromium-family browser with
-#      --remote-debugging-port — it launches nothing itself.
-#   4. LSP language servers (pyright, typescript-language-server, gopls,
-#      rust-analyzer, clangd, nixd) put on PATH so agent/lsp/servers.py
-#      finds them via shutil.which() instead of agent/lsp/install.py's
-#      default "auto" strategy live-fetching them via npm/go/pip on first
-#      use. Still requires `lsp.install_strategy: manual` in config.yaml
-#      (user/HM state, not a Nix concern) so install.py never attempts the
-#      live fetch path for any server NOT in this list.
-#   5. xclip/xsel put on PATH for vision/image-paste clipboard access
-#      (hermes_cli/clipboard.py's X11 backend — this package targets X11;
-#      add wl-clipboard here too if the target session moves to Wayland).
-#
-# Activating Piper is a config.yaml change (user/HM state, not a Nix
-# concern — see nix/homeManagerModules.nix's `settings.tts` merge upstream):
-#
-#   tts:
-#     provider: piper
-#     piper:
-#       voice: <passthru.piperVoicePath of this package>
+# Wrapper over upstream hermes-agent with: Chromium, Piper TTS, browser-use CLI,
+# LSP servers, and clipboard tools pre-baked. Upstream's own uv2nix handles CLI/TUI/web/ACP.
+# Piper activation: config.yaml { tts: { provider: piper, piper: { voice: <passthru.piperVoicePath> } } }
 #
 { lib, stdenv, makeWrapper, fetchurl, fetchFromGitHub, runCommand, chromium, hermes, pkgsHermesRev, python3Packages
 , pyright, nodePackages, gopls, rust-analyzer, nixd, clang-tools, xclip, xsel, rustPlatform, pkgs
 }:
 
 let
-  # browser-use CLI ("Browser Use 3.0" — https://browser-use.com) is
-  # Hermes' default `browser_exec` tool backend (tools/browser_use_cli.py:
-  # _BACKEND_KEY = "browser-use"). It is not consumed by hermes' own venv —
-  # `_find_cli()` shells out to it via `shutil.which("browser-use")` as a
-  # subprocess — so it's built and wrapped independently here, using this
-  # flake's own nixpkgs-25.11 rather than pkgsHermesRev: no ABI to match,
-  # it never shares a PYTHONPATH with hermes's sealed venv.
-  #
-  # Upstream otherwise lazily runs `uv tool install browser-use` on first
-  # use (tools/browser_use_cli.py install_cli()) — a live PyPI fetch this
-  # package should never need. `_find_cli()`'s probe order is managed-dir →
-  # bare PATH → ~/.local/bin, checked *before* any install is attempted, so
-  # putting our own `browser-use` on PATH (same technique as chromium
-  # below) fully pre-empts the runtime install.
-  #
-  # It only calls into `browser_harness` (a CDP client attaching to an
-  # already-running Chromium-family browser with --remote-debugging-port —
-  # it does not launch or download one itself). browser-use's own heavier
-  # deps (openai/anthropic/google-genai/groq/ollama SDKs) back a separate
-  # autonomous-agent mode this codepath never reaches, so nixpkgs'
-  # close-enough versions are fine even though upstream pins every
-  # dependency with `==` — `dontCheckRuntimeDeps` skips the exact-version
-  # metadata check the same way the Piper/onnxruntime fix above does.
-  #
-  # Versions pinned to what `uv tool install browser-use` actually resolved
-  # (2026-08-31). Six of ~35 dependencies aren't in nixpkgs and are
-  # vendored below as plain wheels — pure-Python, no native extensions, so
-  # a wheel fetch with a verified hash is exactly as reproducible as a
-  # from-source build here.
+  # browser-use CLI is a subprocess (tools/browser_use_cli.py: _find_cli).
+  # Baked here to avoid runtime uv tool install. Attaches over CDP to running
+  # browser; does not launch one. Six ~35 deps vendored as wheels (missing from nixpkgs).
   mkWheel = { pname, version, url, hash, dependencies ? [ ] }:
     python3Packages.buildPythonPackage {
       inherit pname version dependencies;
@@ -166,18 +102,8 @@ let
     cdpUse
   ];
 
-  # browser_harness/admin.py re-execs itself as a daemon:
-  # `subprocess.Popen([sys.executable, "-m", "browser_harness.daemon"], env={**os.environ, ...})`.
-  # nixpkgs' buildPythonApplication wrapper does NOT set PYTHONPATH — it
-  # injects dependencies via `site.addsitedir()` calls baked into the
-  # wrapper script itself, which only apply to that one process, not to
-  # subprocesses re-invoking the bare interpreter (verified: `sys.executable`
-  # inside the running app resolves to the plain, dependency-unaware
-  # `python3.13` binary). Without an explicit PYTHONPATH, that respawned
-  # daemon fails immediately with `ModuleNotFoundError: browser_harness`.
-  # makeWrapperArgs' `--set PYTHONPATH` becomes a real exported env var,
-  # which — unlike addsitedir — *does* propagate through Popen's env
-  # inheritance to the child.
+  # browser_harness re-execs as daemon via subprocess.Popen; requires explicit
+  # PYTHONPATH since addsitedir() doesn't propagate to child processes.
   browserUsePythonPath = lib.makeSearchPath python3Packages.python.sitePackages
     (python3Packages.requiredPythonModules browserUseDeps);
 
@@ -195,23 +121,8 @@ let
     doCheck = false;
   };
 
-  # buzz CLI (crates/buzz-cli in block/buzz) — plugins/platforms/buzz/adapter.py
-  # shells out to it (`shutil.which("buzz")` / $BUZZ_CLI_PATH) for nearly
-  # every operation: auth, channel/DM listing, sending, reactions. Built
-  # from source (rustls-only — reqwest/tokio-tungstenite pin "rustls"
-  # everywhere in the workspace Cargo.toml, so no openssl-sys/native-tls
-  # system dependency) rather than fetching a release binary; block/buzz
-  # ships no standalone `buzz` CLI release artifact anyway, only desktop-app
-  # builds. Building against the pinned Cargo.lock in a monorepo pulls in
-  # two non-crates.io git dependencies transitively present in the *lock
-  # file* (not necessarily buzz-cli's own dependency graph — Nix's lockfile
-  # vendoring has no per-target pruning) — both pinned by content hash via
-  # outputHashes below, not by branch.
-  #
-  # Verified: full build succeeds with only these two outputHashes — no
-  # other git dependency needed pinning. (crates.io's download redirector,
-  # https://crates.io/api/v1/crates/.../download, intermittently 403'd
-  # partway through the first attempt in this sandbox — retried clean.)
+  # buzz CLI is a Rust binary from block/buzz monorepo used by buzz/adapter.py.
+  # Built from source (no standalone release); two git deps in Cargo.lock need outputHashes.
   buzzCliSrc = fetchFromGitHub {
     owner = "block";
     repo = "buzz";
@@ -240,20 +151,8 @@ let
     doCheck = false;
   };
 
-  # cua-driver — the MCP-over-stdio backend for the computer_use toolset
-  # (tools/computer_use/cua_backend.py). Unlike buzz-cli, trycua/cua ships
-  # its OWN Nix packaging (nix/cua-driver/package.nix) — same rationale as
-  # consuming hermes-agent-src's own flake instead of re-deriving it by
-  # hand: reuse upstream's maintained package.nix rather than a worse copy.
-  # Zero git dependencies (every crate is a plain crates.io registry
-  # dependency per that file's own comment), so no outputHashes needed —
-  # only the source fetch's own hash. rustls-only (ureq), no openssl-sys.
-  # Building only "-p cua-driver --features portal-input,portal-capture"
-  # (Linux binary; the workspace's macOS/Windows platform crates are
-  # cfg-gated out) pulls in x11rb/pipewire/libei for XTest (X11) and the
-  # GNOME/KDE portal ScreenCast+RemoteDesktop stack (Wayland) — matching
-  # the docs' own prereq table (DISPLAY or XDG_SESSION_TYPE=wayland,
-  # AT-SPI enabled on the DE).
+  # cua-driver (MCP backend for computer_use) uses trycua's own package.nix.
+  # No git deps, no outputHashes needed.
   cuaDriverSrc = fetchFromGitHub {
     owner = "trycua";
     repo = "cua";
@@ -268,35 +167,9 @@ let
     src = "${cuaDriverSrc}/libs/cua-driver/rust";
   };
 
-  # agent-browser (vercel-labs/agent-browser) — the CDP-driving CLI behind
-  # Hermes' *built-in* browser toolset (browser_navigate/click/type/snapshot/
-  # …, tools/browser_tool.py). Distinct from browser-use above: browser.backend
-  # auto-prefers Browser Use mode (browser_exec) when browser-use is on PATH,
-  # but ACP mode's own tool allowlist (acp_adapter/tools.py) never includes
-  # browser_exec — only the built-in agent-browser-backed tools — so ACP's
-  # `hermes acp --setup-browser` (npm install -g agent-browser + a live
-  # Playwright Chromium download into ~/.hermes/node/) is a real, separate
-  # gap this package didn't close.
-  #
-  # The npm package ships prebuilt per-platform binaries with no visible
-  # source (files: bin/, not cli/src/) — not something to vendor as an
-  # opaque blob. The actual source is a Rust crate at vercel-labs/
-  # agent-browser's cli/ (Apache-2.0, crates.io-only deps, no git deps in
-  # Cargo.lock), so it's built from source here exactly like buzz-cli/
-  # cua-driver above, pinned to the same version the npm package currently
-  # publishes (0.35.2).
-  #
-  # install.rs's own fallback for "no bundled Chrome for Testing" is
-  # `--executable-path`/$AGENT_BROWSER_EXECUTABLE_PATH — wired below via
-  # makeWrapperArgs so it always resolves to our chromium and never even
-  # attempts the googlechromelabs.github.io download.
-  #
-  # @askjo/camofox-browser (the other half of `--setup-browser`) is a
-  # separate anti-detection Firefox fork with its own REST server
-  # (tools/browser_camofox.py — Docker or its own git-clone build), an
-  # entirely different runtime, opt-in and off by default. Out of scope
-  # here — not needed for the core browser toolset --setup-browser exists
-  # to unblock.
+  # agent-browser is the CDP CLI for browser_tool.py's built-in browser toolset.
+  # Built from source (Rust, Apache-2.0, no git deps). AGENT_BROWSER_EXECUTABLE_PATH
+  # wired to our chromium.
   agentBrowserSrc = fetchFromGitHub {
     owner = "vercel-labs";
     repo = "agent-browser";
@@ -315,25 +188,8 @@ let
     nativeBuildInputs = [ makeWrapper ];
   };
 
-  # Built from hermes-agent-src's OWN nixpkgs-unstable pin (passed in as
-  # pkgsHermesRev), not this flake's nixpkgs-25.11 — piper-tts is a
-  # buildPythonApplication with native extensions (onnxruntime, a cmake/
-  # cython core), and it lands on hermes's PYTHONPATH via
-  # extraPythonPackages below. Building it against a different nixpkgs
-  # revision risks a python3.12/glibc ABI mismatch against the sealed
-  # uv2nix venv it's injected into.
-  # nixpkgs' top-level `piper-tts` resolves against whatever `python3`
-  # currently defaults to in that revision (observed: 3.14, NOT the 3.12
-  # hermes-agent.nix pins its own venv to) — rebuild the same package.nix
-  # explicitly against python312.pkgs so the site-packages path
-  # ("lib/python3.12/site-packages") and native-extension ABI actually
-  # match the venv it's injected into below.
-  # Top-level callPackage, not `python312.pkgs.callPackage` — the latter's
-  # scope poisons the `python3Packages` name (`throw "do not use
-  # python3Packages ..."`, see pkgs/top-level/python-aliases.nix) precisely
-  # to stop packages *inside* a python set from re-grabbing the whole set.
-  # We're the opposite case: injecting a package built for python3.12 into a
-  # foreign venv, so we explicitly pass `python3Packages` from the top level.
+  # piper-tts built against upstream's nixpkgs revision (pkgsHermesRev) with
+  # python3.12 to match the sealed venv. ABI mismatch if built against our nixpkgs-25.11.
   piperTtsApp =
     (pkgsHermesRev.callPackage
       "${pkgsHermesRev.path}/pkgs/by-name/pi/piper-tts/package.nix"
@@ -346,60 +202,20 @@ let
         withAlignment = false;
       }).overridePythonAttrs
       (old: {
-        # hermes's own sealed venv already carries onnxruntime (transitively,
-        # via the "voice"/faster-whisper dependency group) — the collision
-        # check in hermes-agent.nix's installPhase rejects any
-        # extraPythonPackages closure that duplicates a package already
-        # inside the venv. Piper only calls the stable onnxruntime
-        # InferenceSession API, so it's safe to drop piper's own copy and
-        # let it resolve against hermes's, instead of vendoring two.
-        #
-        # All three are needed together (verified by inspecting the actual
-        # propagatedBuildInputs, not assumed): `dependencies` is what
-        # actually drives propagatedBuildInputs (pythonRemoveDeps alone left
-        # onnxruntime in there); pythonRemoveDeps patches the wheel's own
-        # dist-info METADATA (source pyproject.toml still declares it,
-        # independent of the Nix `dependencies` attr); dontCheckRuntimeDeps
-        # skips pythonRuntimeDepsCheckHook re-flagging the now-removed
-        # requirement as "not installed".
+        # Drop onnxruntime (already in hermes's venv). All three attrs needed:
+        # dependencies drives propagatedBuildInputs, pythonRemoveDeps patches dist-info,
+        # dontCheckRuntimeDeps prevents re-flagging the removed requirement.
         dependencies = builtins.filter (p: (p.pname or p.name or "") != "onnxruntime") old.dependencies;
         pythonRemoveDeps = [ "onnxruntime" ];
         dontCheckRuntimeDeps = true;
       });
 
-  # piper-tts is packaged upstream as buildPythonApplication, not a library
-  # in python3Packages — hermes-agent.nix's extraPythonPackages mechanism
-  # walks `python312.pkgs.requiredPythonModules`, which only recognizes
-  # actual python modules. `toPythonModule` is nixpkgs' standard bridge for
-  # exposing an application's site-packages as an importable dependency.
+  # toPythonModule bridges piper-tts (a buildPythonApplication) to extraPythonPackages.
   piperTts = pkgsHermesRev.python312.pkgs.toPythonModule piperTtsApp;
 
-  # "Hey Hermes" wake word (hermes_cli/config_defaults.py: wake_word.provider,
-  # default "openwakeword"). Traced a live failure: `wake.start` errors with
-  # "No solution found when resolving dependencies... tflite-runtime has no
-  # wheels with a matching Python ABI tag (cp312)" — openwakeword's own
-  # tflite-runtime dependency genuinely publishes no Python 3.12 wheel for
-  # Linux, so no pip/uv install (lazy or otherwise) can ever satisfy it.
-  # This isn't a gap in our packaging: upstream's own nix/packages.nix
-  # "full" build omits "wake" from extraDependencyGroups for the same
-  # reason. "sherpa" (any phrase, no training — see wake_word.provider
-  # options in config_defaults.py) has no such gap and is already in
-  # nixpkgs, so it's wired in here instead of leaving wake word dead.
-  # Activate with `wake_word.provider: sherpa` in config.yaml.
-  #
-  # nixpkgs' sherpa-onnx/sentencepiece (1.13.3/0.2.1) aren't quite what's
-  # needed here: hermes_cli's own lazy-install allowlist (tools/lazy_deps.py
-  # LAZY_DEPS["wake.sherpa"]) pins sherpa-onnx==1.13.4 and
-  # sentencepiece==0.2.2 *exactly*, and its `_is_satisfied()` check compares
-  # the installed version against that exact pin — a one-patch-version
-  # mismatch reads as "not satisfied" and hermes tries to live-`pip install`
-  # the pinned version into the (read-only) Nix store, which fails outright.
-  # Vendoring the exact pinned PyPI wheels sidesteps that entirely: no
-  # native rebuild needed, both ship prebuilt manylinux cp312 wheels.
-  # sherpa-onnx-core carries the shared libraries only (libonnxruntime.so,
-  # libsherpa-onnx-c-api.so, libsherpa-onnx-cxx-api.so under
-  # sherpa_onnx/lib/) — no Python extension of its own, just autoPatchelfHook
-  # so those .so's own NEEDED entries (libstdc++ etc) resolve under NixOS.
+  # Wake word: sherpa (not openwakeword, which has no py3.12 wheel).
+  # Exact pinned versions (sherpa-onnx 1.13.4, sentencepiece 0.2.2) required by
+  # hermes's lazy-install check; nixpkgs has mismatched versions. Vendor wheels.
   sherpaOnnxCore = pkgsHermesRev.python312.pkgs.buildPythonPackage {
     pname = "sherpa-onnx-core";
     version = "1.13.4";
@@ -414,13 +230,8 @@ let
     doCheck = false;
   };
 
-  # sherpa-onnx (the main wheel) carries the actual Python extension —
-  # sherpa_onnx/lib/_sherpa_onnx.cpython-312-*.so — which links against
-  # sherpa-onnx-core's libonnxruntime.so etc. Those live in a *different*
-  # Nix store path, so autoPatchelfHook needs sherpaOnnxCore in
-  # buildInputs to add its lib dir to the RPATH (plain PYTHONPATH/site-dir
-  # coexistence isn't enough — this is a runtime linker resolution, not a
-  # Python import one).
+  # sherpa-onnx's .so files link against sherpaOnnxCore's in a different store path.
+  # autoPatchelfHook needs sherpaOnnxCore in buildInputs to resolve RPATH.
   wakeExtraPythonPackages =
     let
       mkHermesWheel = { pname, version, url, hash, dependencies ? [ ], extra ? { } }:
@@ -442,10 +253,7 @@ let
         extra = {
           nativeBuildInputs = [ pkgsHermesRev.autoPatchelfHook ];
           buildInputs = [ sherpaOnnxCore pkgsHermesRev.stdenv.cc.cc.lib ];
-          # autoPatchelfHook only scans buildInputs' top-level lib/lib64 by
-          # default — sherpaOnnxCore's actual .so's are nested under its
-          # own site-packages/sherpa_onnx/lib/, so its search path needs
-          # adding explicitly (same technique as packages/grok-bot).
+          # autoPatchelfHook needs explicit search path for sherpaOnnxCore's nested .so's.
           preFixup = ''
             addAutoPatchelfSearchPath "${sherpaOnnxCore}/${pkgsHermesRev.python312.sitePackages}/sherpa_onnx/lib"
           '';
@@ -457,24 +265,14 @@ let
         url = "https://files.pythonhosted.org/packages/b6/2d/37e3da037318a70066ded0d51bc2a7f35491ae6338dd993d5eb1503fc3b5/sentencepiece-0.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl";
         hash = "sha256-yKFosEC8YWgSk/ealJtdkRyOJQhvQmAoW42Xq18Rldo=";
       })
-      # sherpa_onnx's keyword-spotter lazily imports pypinyin (Chinese
-      # phrase matching) at first wake-word use — not top-level, so it
-      # didn't surface until actually enabling wake_word. Not in hermes'
-      # own LAZY_DEPS allowlist at all (an upstream omission, not a
-      # version to match), so no exact pin to chase — nixpkgs' pypinyin
-      # has no dependencies of its own, no collision risk.
+      # pypinyin lazy-loaded by sherpa_onnx's keyword-spotter; no exact pin needed.
       pkgsHermesRev.python312.pkgs.pypinyin
     ];
 
-  # en_GB-alba-medium, not the piper1-gpl default (en_US-lessac-medium):
-  # matches the voice already deployed on Rafael's own Piper TTS daemon
-  # (src/tts-daemon/default.nix, TTS_VOICE_MODEL) — one voice across every
-  # tool that talks, not a second arbitrary default.
+  # en_GB-alba-medium matches Rafael's own piper-tts daemon (src/tts-daemon).
   piperVoiceName = "en_GB-alba-medium";
 
-  # Hashes obtained via `nix store prefetch-file` against the upstream
-  # rhasspy/piper-voices HuggingFace repo (content-addressed, verified —
-  # not hand-copied from a download page).
+  # Hashes from rhasspy/piper-voices HuggingFace repo (content-addressed, verified).
   piperVoiceOnnx = fetchurl {
     url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alba/medium/${piperVoiceName}.onnx";
     hash = "sha256-QBNpxKgdCf3YbDLFyGRECBHb3MZkZs3i1k9xM6Zq0Ds=";
@@ -484,20 +282,15 @@ let
     hash = "sha256-qpZaLwLsztYywmlOH8crv/bWXyZfq1Z8qUWRjHPdifQ=";
   };
 
-  # PiperVoice.load() reads the sibling "<name>.onnx.json" next to the
-  # model, so both files must share one directory under their real names
-  # (fetchurl's own store paths are hash-named).
+  # PiperVoice.load() requires .onnx and .onnx.json under real names in same dir.
   piperVoiceDir = runCommand "hermes-piper-voice-${piperVoiceName}" { } ''
     mkdir -p "$out"
     ln -s ${piperVoiceOnnx} "$out/${piperVoiceName}.onnx"
     ln -s ${piperVoiceConfig} "$out/${piperVoiceName}.onnx.json"
   '';
 
-  # Chromium/browser-use (browser_exec), the six LSP servers
-  # (agent/lsp/servers.py's server_id → binary map), X11 clipboard tools
-  # (vision/image-paste), and the buzz CLI (Buzz/Nostr platform plugin) —
-  # all put on the wrapped binaries' PATH so nothing lazily fetches itself
-  # at runtime.
+  # Chromium, browser-use, LSP servers, clipboard tools, and buzz CLI on PATH
+  # to prevent runtime lazy-fetches.
   extraPathTools = [
     chromium
     browserUse
@@ -514,15 +307,8 @@ let
     agentBrowser
   ];
 
-  # faster-whisper (stt.local, config default "base") is already pulled in
-  # by the "voice" dependency group, but WhisperModel("base", ...) — called
-  # with no download_root/local_files_only in tools/transcription_tools.py —
-  # resolves "base" as a Hugging Face repo alias (Systran/faster-whisper-base)
-  # and lazily downloads it via huggingface_hub on first use otherwise.
-  # faster_whisper.download_model() treats an existing directory path as a
-  # ready-made local model, so pointing stt.local.model at this directory in
-  # config.yaml (user/HM state, not a Nix concern) sidesteps the live fetch
-  # entirely — same fetchurl + verified-hash pattern as the Piper voice above.
+  # STT model pre-fetched to avoid lazy download via huggingface_hub.
+  # Config: stt.local.model → <this directory> in config.yaml.
   fasterWhisperModelName = "base";
   fasterWhisperModelDir = runCommand "hermes-faster-whisper-${fasterWhisperModelName}" { } ''
     mkdir -p "$out"
@@ -564,21 +350,15 @@ let
       "parallel-web"
       "vercel"
       "voice"
-      # mcp/httpx2/starlette are already pulled in via "all" (the "mcp"
-      # group), so this adds no new packages — kept explicit to match
-      # upstream's own extra name for the computer_use toolset.
+      # computer-use already in "all"; kept explicit to match upstream's name.
       "computer-use"
     ]
     ++ lib.optionals stdenv.isLinux [ "matrix" ];
     extraPythonPackages = [ piperTts ] ++ wakeExtraPythonPackages;
   };
 
-  # `self` closes the loop: passthru.hermesDesktop must spawn THIS fully
-  # wrapped binary (chromium + piper), not the pre-wrap intermediate that
-  # `.override` alone would leave baked into desktop.nix's hermesAgent
-  # reference. Lazy evaluation makes this safe — self is only forced when
-  # passthru.hermesDesktop is actually built, by which point it's fully
-  # defined.
+  # self closes the loop: hermesDesktop must reference THIS wrapped binary,
+  # not the pre-wrap base. Lazy evaluation ensures self is fully defined when forced.
   self = base.overrideAttrs (old: {
     nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ makeWrapper ];
 
@@ -587,8 +367,7 @@ let
       for bin in hermes hermes-agent hermes-acp; do
         wrapProgram "$out/bin/$bin" --suffix PATH : "${lib.makeBinPath extraPathTools}"
       done
-      # Baked into $out (not just passthru) so it's an actual build input,
-      # not inert metadata nix build would never realize.
+      # Baked into $out as actual build inputs, not just inert metadata.
       ln -s ${piperVoiceDir} "$out/share/hermes-agent/piper-voices"
       ln -s ${fasterWhisperModelDir} "$out/share/hermes-agent/faster-whisper-${fasterWhisperModelName}"
     '';
