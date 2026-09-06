@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
     hermes-agent-src = {
-      url = "github:NousResearch/hermes-agent/v2026.8.27";
+      url = "github:NousResearch/hermes-agent/v2026.8.31";
       # Not `follows`-ed: upstream's uv2nix is pinned to its own nixpkgs-unstable revision.
     };
   };

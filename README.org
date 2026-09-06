@@ -4,7 +4,7 @@
 
 * Overview
 
-A Nix flake wrapping [[https://github.com/NousResearch/hermes-agent][Nous Research's hermes-agent]] (v2026.8.27) with production-ready packaging for NixOS and home-manager.
+A Nix flake wrapping [[https://github.com/NousResearch/hermes-agent][Nous Research's hermes-agent]] (v2026.8.31) with production-ready packaging for NixOS and home-manager.
 
 ** Packages
 
