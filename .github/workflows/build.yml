@@ -1,0 +1,128 @@
+name: Build and publish to Cachix
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+# Cancel a superseded run for the same ref instead of letting a stack of
+# heavy (~20-50min) builds run to completion one after another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Free disk space
+        # The default runner's ~14GB free is not enough for a Chromium +
+        # full Rust-toolchain Nix build; drop preinstalled SDKs we never use.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Lint Nix files
+        run: nix-instantiate --parse flake.nix default.nix >/dev/null
+
+      - name: Check instantiation
+        run: nix eval --raw .#default.drvPath >/dev/null
+
+      - name: Build package
+        run: nix build .#default --no-link
+
+      - name: Push to Cachix
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        run: |
+          OUT=$(nix build .#default --no-link --print-out-paths)
+          nix run nixpkgs#cachix -- push rafa-dot-el "$OUT"
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_SIGNING_KEY: ${{ secrets.CACHIX_SIGNING_KEY }}
+
+  # linux/amd64 only for now — arm64 needs either a GitHub-hosted ARM64
+  # runner (availability/cost unconfirmed for this private repo) or a real
+  # remote aarch64 builder (which would mean putting SSH key material into
+  # Actions secrets, a decision deliberately not made here). The flake
+  # already declares aarch64-linux as a system, so a second job building
+  # ociImage on an ARM64 runner and assembling a manifest with this one is
+  # the whole change once that's decided — nothing else needs restructuring.
+  # Until then, publish arm64 manually: `task oci:push` from an aarch64 host.
+  oci:
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          # Pull from Cachix instead of rebuilding — the build job just pushed this exact path.
+          extra-conf: |
+            extra-substituters = https://rafa-dot-el.cachix.org
+            extra-trusted-public-keys = rafa-dot-el.cachix.org-1:I0G/BFdImu6qOxksmG/ioVQhITG2dFi+IvZo+r72JPA=
+
+      - name: Build and load OCI image
+        run: |
+          OUT=$(nix build .#ociImage --no-link --print-out-paths)
+          docker load < "$OUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag and push
+        run: |
+          docker tag hermes-agent:latest rafadotel/hermes-agent:latest
+          docker push rafadotel/hermes-agent:latest
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            docker tag hermes-agent:latest "rafadotel/hermes-agent:${VERSION}"
+            docker push "rafadotel/hermes-agent:${VERSION}"
+          fi
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          DOCKER_TAG="${TAG#v}"
+          NOTES="Cachix cache: https://app.cachix.org/cache/rafa-dot-el#pull"
+          NOTES="${NOTES}
+          Docker Hub image: https://hub.docker.com/r/rafadotel/hermes-agent (tag ${DOCKER_TAG})"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes "$NOTES"

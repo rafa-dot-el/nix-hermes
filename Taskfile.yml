@@ -1,0 +1,264 @@
+version: "3"
+
+silent: true
+
+vars:
+  PKG_DIR: "{{.TASKFILE_DIR}}"
+
+tasks:
+  default:
+    desc: "List tasks"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - task --list-all
+
+  check:
+    desc: "Full syntax/eval validation: lint (nix parse + actionlint) + flake eval check"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - task: lint
+      - nix eval --raw .#default.drvPath
+
+  lint:
+    desc: "Parse-check every .nix file (recursive) and lint GitHub Actions workflow YAML"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        rc=0
+        for f in $(find . -name '*.nix' -not -path './.git/*'); do
+          nix-instantiate --parse "$f" >/dev/null 2>&1 || { echo "FAIL: $f"; rc=1; }
+        done
+        nix run nixpkgs#actionlint -- .github/workflows/*.yml || rc=1
+        exit $rc
+
+  build:
+    desc: "Build the default package (hermes CLI + TUI + web dashboard + ACP + TTS/STT) via this package's own flake"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix build .#default --no-link
+
+  build:slim:
+    desc: "Build hermes-slim (bare CLI + TUI, no browser/voice/LSP extras)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix build .#hermes-slim --no-link
+
+  build:desktop:
+    desc: "Build the Hermes Desktop launcher (picks x11/wayland at runtime)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix build .#hermes-desktop --no-link
+
+  # TUI is the default face of the agent: `task` / `task run` drops into the
+  # Ink TUI chat. --tui is explicit so it wins over any display.interface
+  # config and never silently falls back to the classic REPL.
+  run:
+    desc: "Launch the Hermes TUI chat (default)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build --no-link --print-out-paths .#default)"
+        exec "$out/bin/hermes" chat --tui {{.CLI_ARGS}}
+
+  run:cli:
+    desc: "Launch the classic REPL chat (no TUI)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build --no-link --print-out-paths .#default)"
+        exec "$out/bin/hermes" chat --cli {{.CLI_ARGS}}
+
+  run:dashboard:
+    desc: "Launch the Hermes web dashboard (localhost:9119)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build --no-link --print-out-paths .#default)"
+        exec "$out/bin/hermes" dashboard {{.CLI_ARGS}}
+
+  run:desktop:
+    desc: "Launch the Hermes Desktop app (picks x11/wayland at runtime)"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build --no-link --print-out-paths .#hermes-desktop)"
+        exec "$out/bin/hermes-desktop" {{.CLI_ARGS}}
+
+  test:
+    desc: "Run passthru.tests if defined, else build the package itself"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        if nix eval --json .#default.passthru.tests >/dev/null 2>&1; then
+          nix build .#default.passthru.tests --no-link
+        else
+          echo "no passthru.tests -- building package itself"
+          nix build .#default --no-link
+        fi
+
+  cache:push:
+    desc: >-
+      Build hermes-agent via its own standalone flake and push the
+      resulting store path to the rafa-dot-el Cachix cache. Reads the push
+      token from pass (code/cachix/tokens-main-ci); never persists it to
+      disk.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        out="$(nix build .#default --no-link --print-out-paths)"
+        echo "[*] Pushing $out to rafa-dot-el..."
+        CACHIX_AUTH_TOKEN="$(pass show code/cachix/tokens-main-ci)" \
+          nix run nixpkgs#cachix -- push rafa-dot-el "$out"
+        echo "[+] Pushed hermes-agent to rafa-dot-el"
+
+  oci:build:
+    desc: >-
+      Build the OCI image (rafadotel/hermes-agent) via dockerTools and load
+      it into the local docker daemon. Pass TAG=vX.Y.Z to also tag that
+      version (the leading "v" is stripped for the Docker tag); otherwise
+      only :latest is tagged. Builds for the host's own architecture only —
+      run this on an aarch64 host to publish an arm64 image (see build.yml's
+      oci job comment for why CI doesn't do this yet).
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        out="$(nix build .#ociImage --no-link --print-out-paths)"
+        docker load < "$out"
+        docker tag hermes-agent:latest rafadotel/hermes-agent:latest
+        if [ -n "${TAG:-}" ]; then
+          docker tag hermes-agent:latest "rafadotel/hermes-agent:${TAG#v}"
+        fi
+        echo "[+] Loaded rafadotel/hermes-agent:latest${TAG:+ and :${TAG#v}}"
+
+  oci:push:
+    desc: >-
+      Build and push the OCI image to Docker Hub as rafadotel/hermes-agent.
+      Pass TAG=vX.Y.Z to also push that version tag. Reads the access token
+      from pass (code/hub.docker.com-token); never persists it to disk.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - task: oci:build
+      - |
+        set -euo pipefail
+        pass show code/hub.docker.com-token | docker login -u rafadotel --password-stdin
+        docker push rafadotel/hermes-agent:latest
+        if [ -n "${TAG:-}" ]; then
+          docker push "rafadotel/hermes-agent:${TAG#v}"
+        fi
+        echo "[+] Pushed rafadotel/hermes-agent:latest${TAG:+ and :${TAG#v}}"
+
+  tag:
+    desc: >-
+      Create an annotated git tag (TAG=vX.Y.Z required) and push it to both
+      internal and public remotes. Pushing a v* tag triggers CI's build →
+      Cachix → OCI → release pipeline; run this task alone (without task
+      release) if you only want that.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        : "${TAG:?TAG=vX.Y.Z is required}"
+        git tag -a "$TAG" -m "$TAG"
+        git push internal "$TAG"
+        git push public "$TAG"
+        echo "[+] Tagged and pushed $TAG"
+
+  release:
+    desc: >-
+      Create a GitHub Release for TAG=vX.Y.Z (the tag must already exist —
+      run `task tag TAG=vX.Y.Z` first), linking Cachix and Docker Hub.
+      Local equivalent of build.yml's release job, for publishing without CI.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        : "${TAG:?TAG=vX.Y.Z is required}"
+        gh release create "$TAG" -R rafa-dot-el/nix-hermes \
+          --title "$TAG" \
+          --generate-notes \
+          --notes "Cachix cache: https://app.cachix.org/cache/rafa-dot-el#pull
+        Docker Hub image: https://hub.docker.com/r/rafadotel/hermes-agent (tag ${TAG#v})"
+        echo "[+] Released $TAG"
+
+  clean:
+    desc: "Remove local build symlinks (does not touch the Nix store). Fast (~1s)."
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - rm -rf result result-*
+
+  check-update:
+    desc: >-
+      Compare the pinned upstream tag (flake.nix hermes-agent-src.url) against
+      the newest calendar-versioned tag (vYYYY.M.D[.N]) on
+      NousResearch/hermes-agent. Exit 2 when an update is available.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        FLAKE="{{.PKG_DIR}}/flake.nix"
+        PINNED="$(grep -m1 'hermes-agent-src.url' "$FLAKE" | sed -E 's#.*/hermes-agent/([^"]+)".*#\1#')"
+        LATEST="$(git ls-remote --tags --refs https://github.com/NousResearch/hermes-agent \
+          | sed -E 's#.*refs/tags/##' \
+          | grep -E '^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$' \
+          | sort -V | tail -1)"
+        echo "check-update: pinned=${PINNED} latest=${LATEST}"
+        if [ "$PINNED" != "$LATEST" ]; then
+          echo "check-update: update available (${PINNED} -> ${LATEST})" >&2
+          exit 2
+        fi
+
+  update:
+    desc: >-
+      Bump hermes-agent-src.url to the newest upstream tag, refresh
+      flake.lock, then check+build. Pass TAG=vYYYY.M.D to pin explicitly
+      instead of auto-detecting the latest.
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - |
+        set -euo pipefail
+        FLAKE="{{.PKG_DIR}}/flake.nix"
+        TAG="${TAG:-}"
+        if [ -z "$TAG" ]; then
+          TAG="$(git ls-remote --tags --refs https://github.com/NousResearch/hermes-agent \
+            | sed -E 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$' \
+            | sort -V | tail -1)"
+        fi
+        perl -i -pe 's#(github:NousResearch/hermes-agent/)[^"]+#${1}'"${TAG}"'#' "$FLAKE"
+        echo "update: pinned hermes-agent-src to ${TAG}"
+      - task: update:flake-lock
+      - task: check
+      - task: build
+
+  update:flake-lock:
+    internal: true
+    desc: "Refresh this package's own flake.lock"
+    dir: "{{.TASKFILE_DIR}}"
+    silent: true
+    cmds:
+      - nix flake update
