@@ -57,6 +57,14 @@ let
       "modal"
       "parallel-web"
       "vercel"
+      # Vertex AI. Upstream drops [vertex] from "all" (lazy-install policy,
+      # 2026-05-12), and tools/lazy_deps.py cannot install into the
+      # read-only store — but its sole member, google-auth==2.55.1, still
+      # arrives via all -> hermes-agent[google], so this is currently a
+      # no-op (identical drv hash). Listed anyway, like "computer-use"
+      # below, so agent/vertex_adapter.py keeps its dependency if upstream
+      # ever drops google-auth from [google] or [google] from "all".
+      "vertex"
     ]
     ++ lib.optionals withVoice [ "voice" ]
     # computer-use already in "all"; kept explicit to match upstream's name.
