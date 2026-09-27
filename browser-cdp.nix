@@ -21,15 +21,30 @@
 # This script's only job is to make a Chromium from THIS flake actually
 # listening there before Hermes execs, so that override is always live.
 #
-# Prints the resolved http://127.0.0.1:<port> CDP URL on success (the
-# --run hook in default.nix exports it as BROWSER_CDP_URL); prints nothing
-# and always exits 0 otherwise (no display, a squatted port, a slow-starting
-# browser, …) so a failure here degrades to today's behavior instead of
-# breaking `hermes` outright.
+# Prints the resolved http://127.0.0.1:<port> CDP URL on success; prints
+# nothing and always exits 0 otherwise (no display, a squatted port, a
+# slow-starting browser, …) so a failure here degrades to today's behavior
+# instead of breaking `hermes` outright.
+#
+# Two callers, two modes:
+#   - hermes/hermes-agent/hermes-acp's own --run hook (default.nix) calls
+#     this with `--print-only`: backoff-check + compute the target port/dir
+#     + print the URL, with NO curl probe and NO Chromium spawn. Cheap
+#     enough to run unconditionally on every invocation, since a query that
+#     never touches a browser tool must never pay for one.
+#   - browser-use's own --run hook (browser.nix) calls this with no
+#     argument (the full, original behavior: backoff + probe + launch +
+#     poll). That binary is only ever spawned as a subprocess when
+#     Hermes's browser_exec tool actually runs — so this is the real,
+#     lazy trigger point, not `hermes` startup.
+# Both must agree on the same port/dir defaulting so the URL the cheap
+# caller prints is the one the heavy caller actually launches on.
 { writeShellScriptBin, chromium, util-linux, curl }:
 
 writeShellScriptBin "hermes-ensure-browser-debug" ''
   set -uo pipefail
+
+  mode="''${1:-launch}"
 
   # An override already in effect anywhere — this process's own env, a live
   # `/browser connect`, or Browser Use's own BU_CDP_* vars — is authoritative;
@@ -59,6 +74,18 @@ writeShellScriptBin "hermes-ensure-browser-debug" ''
   # override HERMES_BROWSER_DEBUG_PORT too for real isolation between them.
   port="''${HERMES_BROWSER_DEBUG_PORT:-9222}"
   data_dir="''${HERMES_BROWSER_DEBUG_DIR:-$hermes_home/chrome-debug}"
+
+  # print-only: just hand the target URL to the caller (hermes/hermes-agent/
+  # hermes-acp's own --run hook) so BROWSER_CDP_URL is non-empty by the time
+  # Hermes decides whether to pass a CDP override down at all. No curl probe,
+  # no mkdir, no Chromium — must never block or spawn anything, since this
+  # runs on every invocation regardless of whether a browser tool is ever
+  # used. The URL need not be live yet: browser-harness's own daemon retries
+  # for 30s once a real browser_exec call actually needs it.
+  if [ "$mode" = "--print-only" ]; then
+    printf 'http://127.0.0.1:%s\n' "$port"
+    exit 0
+  fi
 
   # A real HTTP GET, not just a TCP connect — matching how Hermes's own
   # is_browser_debug_ready()/discover_local_cdp_url() (hermes_cli/browser_connect.py)

@@ -23,19 +23,19 @@ let
 
   browserEnsureDebug = pkgs.callPackage ./browser-cdp.nix { inherit chromium; };
 
-  # Preflight run before every `hermes`/`hermes-agent`/`hermes-acp` launch:
-  # make a from-this-flake Chromium reachable over CDP with zero manual
-  # steps (see browser-cdp.nix for why browser-harness's own auto-launch
-  # can't be trusted to find it), without ever overriding a CDP endpoint the
-  # user or Hermes itself already has in effect. Always exits 0 — a failed
-  # probe/launch here must never stop `hermes` from starting.
+  # Cheap, instant --run hook for every `hermes`/`hermes-agent`/`hermes-acp`
+  # launch: only computes and exports the CDP URL Hermes should aim at if it
+  # ever needs one — never probes or launches Chromium here. Hermes's own
+  # browser_exec resolution (tools/browser_use_cli.py:_resolve_backend_cdp)
+  # reads BROWSER_CDP_URL from THIS process's env, but only when the agent
+  # actually calls a browser tool, at which point it spawns the browser-use
+  # CLI as a fresh subprocess — THAT wrapper (browser.nix) is where the real
+  # probe-and-launch happens, lazily, exactly once per actual need. Doing the
+  # heavy work here instead would launch a whole Chromium on every `hermes`
+  # invocation, including ones that never touch a browser tool at all.
   browserCdpAutoRun = ''
-    _hermes_cdp_active=0
-    if [ -n "''${BROWSER_CDP_URL:-}" ] || [ -n "''${BU_CDP_URL:-}" ] || [ -n "''${BU_CDP_WS:-}" ]; then
-      _hermes_cdp_active=1
-    fi
-    if [ "$_hermes_cdp_active" = 0 ]; then
-      _hermes_cdp_url="$(${browserEnsureDebug}/bin/hermes-ensure-browser-debug 2>/dev/null)" || _hermes_cdp_url=""
+    if [ -z "''${BROWSER_CDP_URL:-}" ] && [ -z "''${BU_CDP_URL:-}" ] && [ -z "''${BU_CDP_WS:-}" ]; then
+      _hermes_cdp_url="$(${browserEnsureDebug}/bin/hermes-ensure-browser-debug --print-only 2>/dev/null)" || _hermes_cdp_url=""
       if [ -n "$_hermes_cdp_url" ]; then
         export BROWSER_CDP_URL="$_hermes_cdp_url"
       fi
