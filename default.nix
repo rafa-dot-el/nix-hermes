@@ -21,6 +21,27 @@ let
   inherit (pkgs.callPackage ./browser.nix { inherit chromium; })
     browserUse agentBrowser cuaDriver buzzCli;
 
+  browserEnsureDebug = pkgs.callPackage ./browser-cdp.nix { inherit chromium; };
+
+  # Preflight run before every `hermes`/`hermes-agent`/`hermes-acp` launch:
+  # make a from-this-flake Chromium reachable over CDP with zero manual
+  # steps (see browser-cdp.nix for why browser-harness's own auto-launch
+  # can't be trusted to find it), without ever overriding a CDP endpoint the
+  # user or Hermes itself already has in effect. Always exits 0 — a failed
+  # probe/launch here must never stop `hermes` from starting.
+  browserCdpAutoRun = ''
+    _hermes_cdp_active=0
+    if [ -n "''${BROWSER_CDP_URL:-}" ] || [ -n "''${BU_CDP_URL:-}" ] || [ -n "''${BU_CDP_WS:-}" ]; then
+      _hermes_cdp_active=1
+    fi
+    if [ "$_hermes_cdp_active" = 0 ]; then
+      _hermes_cdp_url="$(${browserEnsureDebug}/bin/hermes-ensure-browser-debug 2>/dev/null)" || _hermes_cdp_url=""
+      if [ -n "$_hermes_cdp_url" ]; then
+        export BROWSER_CDP_URL="$_hermes_cdp_url"
+      fi
+    fi
+  '';
+
   inherit (pkgs.callPackage ./voice.nix { inherit pkgsHermesRev; })
     hermes-voice-dependencies piperVoiceDir piperVoiceName
     fasterWhisperModelDir fasterWhisperModelName;
@@ -72,7 +93,9 @@ let
     postFixup = ''
       ${old.postFixup or ""}
       for bin in hermes hermes-agent hermes-acp; do
-        wrapProgram "$out/bin/$bin" --suffix PATH : "${lib.makeBinPath extraPathTools}"
+        wrapProgram "$out/bin/$bin" \
+          --suffix PATH : "${lib.makeBinPath extraPathTools}" \
+          ${lib.optionalString withBrowser "--run ${lib.escapeShellArg browserCdpAutoRun}"}
       done
     ''
     # Baked into $out as actual build inputs, not just inert metadata.

@@ -209,10 +209,33 @@ stt:
 ** Browser automation (browser-use + agent-browser)
 
 The CLI has two browser backends:
-- *browser-use*: Autonomous agent-driven browser control (requires Chromium running with --remote-debugging-port)
+- *browser-use*: Autonomous agent-driven browser control (=browser_exec=, the default backend — active whenever the =browser-use= CLI is on PATH, which it always is in this package)
 - *agent-browser*: Built-in browser toolset for hermes_agent (CDP-driven)
 
-Both auto-detect Chromium on PATH (included in this package).
+Both need a Chromium actually listening for CDP, which is where upstream's
+own auto-detection falls short on a fresh machine: =browser-harness=
+(browser-use's local-Chrome discovery, pinned in [[file:browser.nix][browser.nix]]) only
+recognizes a browser holding one of a few standard profile dirs
+(=~/.config/{google-chrome,chromium,microsoft-edge}=) — a Chromium on any
+other =--user-data-dir= is invisible to it, and plain Chromium has no "Allow
+remote debugging?" toggle for it to fall back to either.
+
+Rather than patch that pinned dependency, [[file:browser-cdp.nix][browser-cdp.nix]] wraps
+=hermes=/=hermes-agent=/=hermes-acp= with a preflight that ensures a Chromium
+from this flake is listening on a dedicated, persistent profile and exports
+=BROWSER_CDP_URL= — Hermes's own first-class override for this
+(=browser.cdp_url= in config.yaml is the persistent equivalent), which both
+backends already honor ahead of any local-Chrome discovery. It backs off
+completely if a CDP endpoint is already configured (env or config.yaml), so
+it never overrides an explicit choice.
+
+Defaults: port =9222=, profile dir =$HERMES_HOME/chrome-debug= (matching
+upstream's own =chrome_debug_data_dir()= convention) — already distinct per
+profile, since each profile sets its own =HERMES_HOME= (see
+=services.hermes-agent.hermesHome= above, or a multi-profile CLI setup).
+Override either independently with =HERMES_BROWSER_DEBUG_PORT= /
+=HERMES_BROWSER_DEBUG_DIR= when a profile needs its own regardless of
+=HERMES_HOME=.
 
 ** Wake word (sherpa)
 
@@ -340,7 +363,26 @@ If missing, verify Hermes is installed correctly and Nix cache is working.
 
 ** Browser automation not working
 
-Ensure Chromium is on PATH:
+First check whether the auto-launched debug Chromium ever came up:
+
+#+begin_src bash
+echo "${HERMES_HOME:-$HOME/.hermes}/chrome-debug/DevToolsActivePort"
+cat "${HERMES_HOME:-$HOME/.hermes}/chrome-debug/DevToolsActivePort"
+#+end_src
+
+No such file: the preflight ([[file:browser-cdp.nix][browser-cdp.nix]]) couldn't launch Chromium (no
+display, sandboxing, disk full, …) — run it directly to see why:
+
+#+begin_src bash
+hermes-ensure-browser-debug
+#+end_src
+
+A CDP endpoint already configured (=BROWSER_CDP_URL=/=BU_CDP_URL=/=BU_CDP_WS=
+env, or =browser.cdp_url= in config.yaml) makes the preflight back off
+entirely — that endpoint is then on you to keep reachable.
+
+Ensure Chromium itself is on PATH (used directly by =agent-browser= and by
+the preflight):
 
 #+begin_src bash
 which chromium
