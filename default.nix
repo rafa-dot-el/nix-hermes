@@ -52,7 +52,6 @@ let
       "fal"
       "feishu"
       "firecrawl"
-      "hindsight"
       "honcho"
       "modal"
       "parallel-web"
