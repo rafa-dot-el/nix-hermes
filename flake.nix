@@ -51,6 +51,8 @@
             hermesDesktop = hermesFull.passthru.hermesDesktop;
           };
 
+          hermesBrowser = pkgs.callPackage ./browser-session.nix { };
+
           ociImage = pkgs.dockerTools.buildLayeredImage {
             name = "hermes-agent";
             tag = "latest";
@@ -65,6 +67,8 @@
           desktop = hermesFull.passthru.hermesDesktop;
           inherit (desktopVariants) hermes-desktop-x11 hermes-desktop-wayland hermes-desktop;
           inherit (hermes) minimal tui web;
+          hermes-browser = hermesBrowser;
+          hermes-chromium = pkgs.chromium;
         });
 
       # Replaces (not extends) upstream's own module — see nixos/dashboard.nix
